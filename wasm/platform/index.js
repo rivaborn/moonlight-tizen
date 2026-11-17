@@ -4693,7 +4693,8 @@ function waitForHostAndNavigate(serverUid) {
 // - If the host is offline: removes it from preview and returns to the Moonlight home screen.
 // - If the app no longer exists on the server: connects to the host and shows the current app list.
 // - If the app exists: connects to the host and navigates directly to the app list.
-function waitForHostAndNavigateToApp(serverUid, appId) {
+// appName (MyScreen's pending launch): the app is found by its title when appId is null.
+function waitForHostAndNavigateToApp(serverUid, appId, appName) {
   var attempts = 0;
   var interval = setInterval(function() {
     attempts++;
@@ -4707,7 +4708,7 @@ function waitForHostAndNavigateToApp(serverUid, appId) {
       if (!host.online) {
         hostChosen(host, function() {
           // Success callback: The host is now online. Retry the deep link navigation.
-          waitForHostAndNavigateToApp(serverUid, appId);
+          waitForHostAndNavigateToApp(serverUid, appId, appName);
         });
         return;
       }
@@ -4752,7 +4753,11 @@ function waitForHostAndNavigateToApp(serverUid, appId) {
         }
 
         var appExists = appList.some(function(app) {
-          return app.id === appId;
+          if (app.id === appId || (appId == null && appName && app.title === appName)) {
+            appId = app.id;
+            return true;
+          }
+          return false;
         });
         if (appExists) {
           // App still exists: connect, show the app list, and auto-launch the app
@@ -4795,6 +4800,68 @@ function waitForHostAndNavigateToApp(serverUid, appId) {
       if (host) hostChosen(host); // Fallback to trigger offline error or Auto WOL
     }
   }, 1000);
+}
+
+// MyScreen (github.com/rivaborn/MyScreen) starts a stream on this TV: the TV's network API opens Moonlight, but
+// drops any data sent with it, so the PC and app can't be passed in. MyScreen leaves the launch waiting instead and
+// serves it, once, at http://<PC>:47801/moonlight/pending ({"serverUid","pcName","appName"}; 204 when none). On
+// opening and on coming back to the front, Moonlight asks each saved PC, then starts the app as a deep link would.
+var MYSCREEN_PENDING_PORT = 47801;
+var _myScreenChecking = false;
+
+function myScreenHostOnly(address) {
+  var a = String(address || '');
+  if (a.charAt(0) === '[') return a.substring(0, a.indexOf(']') + 1); // [IPv6]:port
+  var parts = a.split(':');
+  return parts.length === 2 ? parts[0] : a; // host:port, or a bare IPv6 address
+}
+
+function checkMyScreenPendingLaunch(attempt) {
+  if (!isHostsLoaded || Object.keys(hosts).length === 0) {
+    if (attempt < 30) {
+      setTimeout(function() {
+        checkMyScreenPendingLaunch(attempt + 1);
+      }, 500);
+    }
+    return;
+  }
+  if (_myScreenChecking) {
+    return;
+  }
+  _myScreenChecking = true;
+  var pending = 0;
+  var taken = false;
+  Object.keys(hosts).forEach(function(uid) {
+    var address = myScreenHostOnly(hosts[uid] && hosts[uid].address);
+    if (!address) {
+      return;
+    }
+    pending++;
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', 'http://' + address + ':' + MYSCREEN_PENDING_PORT + '/moonlight/pending', true);
+    xhr.timeout = 2000;
+    xhr.onloadend = function() {
+      if (--pending === 0) {
+        _myScreenChecking = false;
+      }
+      if (taken || xhr.status !== 200) {
+        return;
+      }
+      try {
+        var launch = JSON.parse(xhr.responseText);
+        var serverUid = hosts[launch.serverUid] ? launch.serverUid : uid;
+        taken = true;
+        console.log('%c[index.js, checkMyScreenPendingLaunch]', 'color: green;', 'MyScreen launch from ' + address + ': ' + launch.appName);
+        waitForHostAndNavigateToApp(serverUid, null, launch.appName);
+      } catch (e) {
+        console.error('%c[index.js, checkMyScreenPendingLaunch]', 'color: green;', 'Error: bad MyScreen launch: ' + e.message);
+      }
+    };
+    xhr.send();
+  });
+  if (pending === 0) {
+    _myScreenChecking = false;
+  }
 }
 
 // Handles deep link navigation when the app is launched from a Smart Hub Preview tile.
@@ -5018,6 +5085,12 @@ function onWindowLoad() {
   initSamsungKeys();
   initSpecialKeys();
   loadUserData();
+
+  // MyScreen: a launch the PC is waiting to start (on opening, and on coming back to the front)
+  checkMyScreenPendingLaunch(0);
+  document.addEventListener('visibilitychange', function() {
+    if (!document.hidden) checkMyScreenPendingLaunch(0);
+  });
 
   probeSmartHubSupport().then(function() {
     // Handle deep links from Smart Hub Preview tile clicks (initial launch)
